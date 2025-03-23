@@ -1,0 +1,346 @@
+name: Build and Release OpenWRT
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - wg620443
+      - v24.10.0-wg620443
+      - v24.10.1-wg620443
+      - v24.10.2-wg620443
+
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 1440
+    container:
+      image: public.ecr.aws/docker/library/python:3.11-slim-bookworm
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        TZ: Asia/Taipei
+
+    steps:
+      - name: 安裝 gosu
+        run: |
+          set -eux
+          GOSU_VERSION=1.17
+
+          # Save list of manually installed packages
+          savedAptMark="$(apt-mark showmanual)"
+
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates gnupg wget
+          rm -rf /var/lib/apt/lists/*
+
+          dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')"
+
+          wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${dpkgArch}"
+          wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${dpkgArch}.asc"
+
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4
+          gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu
+          gpgconf --kill all
+          rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc
+
+          apt-mark auto '.*' > /dev/null
+          [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark
+          apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false
+
+          chmod +x /usr/local/bin/gosu
+
+          # Verify installation
+          gosu --version
+          gosu nobody true
+
+      - name: 檢測資料夾權限
+        run: |
+          HOST_UID=$(stat -c "%u" /github/home)
+          HOST_GID=$(stat -c "%g" /github/home)
+
+          echo "HOST_UGID=${HOST_UID}:${HOST_GID}" >> $GITHUB_ENV
+
+      - name: 更新套件清單並安裝編譯依賴
+        run: |
+          apt-get update
+
+          apt-get install -y \
+            build-essential clang curl flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-distutils python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            libexpat1-dev clang-format \
+            python3-yaml ruby-full libcap2-bin libsndio-dev libmariadb-dev libxml-parser-perl
+
+          python3 -c "import sys; assert sys.version_info[:2] == (3,11), f'Expected Python 3.11, got {sys.version}'"
+
+      - name: Checkout OpenWRT 程式碼
+        uses: actions/checkout@v4
+
+      - name: 變更 OpenWRT 目錄擁有者
+        run: chown -R "${HOST_UGID}" .
+
+      - name: 更新 feeds
+        run: |
+          gosu "${HOST_UGID}" ./scripts/feeds update -a
+          gosu "${HOST_UGID}" ./scripts/feeds install -a
+
+      - name: 複製自訂 .config
+        run: |
+          gosu "${HOST_UGID}" cp .config.wg620443 .config
+
+      - name: 清理目錄
+        run: |
+          gosu "${HOST_UGID}" make dirclean
+
+      - name: Patch Makefile DEPENDS for multiple packages
+        run: |
+          set -eux
+          patch_depends() {
+            local pkg="$1"
+            local dep="$2"
+            local file="$3"
+            sed -i "/^define Package\/${pkg}\$/,/^endef$/ {
+              s/^\(DEPENDS.*\)/\1 ${dep}/
+            }" "${file}"
+          }
+      
+          patch_depends lvm2 "+libnvme" feeds/packages/utils/lvm2/Makefile
+          patch_depends cjdns "+libuv" feeds/routing/cjdns/Makefile
+
+          # fix mesa cannot find dependencies
+          gosu "${HOST_UGID}" make -j$(nproc) tools/install V=s 
+          gosu "${HOST_UGID}" make toolchain/clean
+          gosu "${HOST_UGID}" make toolchain/compile V=s
+          gosu "${HOST_UGID}" make -j$(nproc) toolchain/install V=s 
+          gosu "${HOST_UGID}" make -j$(nproc) package/python3/host/compile V=s
+          chown -R "${HOST_UGID}" /usr/lib/python3.11
+          staging_dir/host/bin/python3 -m pip install --prefix=/usr -r feeds/video/libs/mesa/host-pip-requirements.txt --break-system-packages --no-compile
+
+          # fix abimap not found
+          pip install abimap --break-system-packages
+
+          # fix qtbase-everyshere
+          gosu "${HOST_UGID}" make -j$(nproc) package/qt5base/prepare V=s 
+          sed -i '1i #include <limits>' "build_dir/target-aarch64_cortex-a53_musl/qtbase-everywhere-src-5.15.0/src/corelib/global/qglobal.h"
+
+
+      - name: 編譯韌體
+        shell: bash
+        run: |
+          for dir in /.cache /.cargo /.local; do
+            mkdir -p "$dir"
+            chmod -R 777 "$dir"
+          done
+          
+          LOG_DIR=artifact/logs
+          echo "LOG_DIR=${LOG_DIR}" >> $GITHUB_ENV
+          mkdir -p "${LOG_DIR}"
+
+          LOGFILE="${LOG_DIR}/build_firmware.log"
+          echo "LOGFILE=${LOGFILE}" >> $GITHUB_ENV
+
+          set +e
+          IGNORE_ERRORS=1 gosu "${HOST_UGID}" make -k -j"$(nproc)" V=s | tee "$LOGFILE"
+          MAKE_RESULT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$MAKE_RESULT" -ne 0 ]; then
+            echo "⚠️ Firmware build failed. See ${LOGFILE}"
+            exit "$MAKE_RESULT"
+          fi
+
+      - name: 整理編譯產物
+        run: |
+          ARTIFACT_DIR="./artifact"
+          FIRMWARE_DIR="$ARTIFACT_DIR/firmware"
+          BUILDINFO_DIR="$ARTIFACT_DIR/buildinfo"
+          MAKECONFIG_DIR="$ARTIFACT_DIR/makeconfig"
+          TMP_PKG_DIR="/tmp/packages"
+          PACKAGE_TGZ="$ARTIFACT_DIR/packages.tgz"
+
+          set -e
+
+          echo "建立產物目錄..."
+          mkdir -p "$FIRMWARE_DIR" "$BUILDINFO_DIR" "$MAKECONFIG_DIR" "$TMP_PKG_DIR"
+          chmod 777 "$FIRMWARE_DIR" "$BUILDINFO_DIR" "$MAKECONFIG_DIR" "$TMP_PKG_DIR"
+
+          echo "複製 Firmware 檔案..."
+          find ./bin/targets -maxdepth 3 -type f \( -name "*.bin" -o -name "*.img" -o -name "*.trx" -o -name "*.img.gz" -o -name "*.ubi" -o -name "*.ubifs" \) -exec cp -fv {} "$FIRMWARE_DIR/" \;
+
+          echo "複製 Buildinfo 和 Manifest 檔案..."
+          find ./bin/targets -maxdepth 3 -type f \( -name "*.buildinfo" -o -name "*.manifest" \) -exec cp -fv {} "$BUILDINFO_DIR/" \;
+          cp bin/targets/mediatek/filogic/profiles.json "$BUILDINFO_DIR/"
+
+          echo "複製 .config 檔案..."
+          cp -fv .config "$MAKECONFIG_DIR/"
+
+          echo "複製 IPK 套件檔案..."
+          find ./bin/packages/ -type f -name "*.ipk" -exec cp -fv {} "$TMP_PKG_DIR/" \;
+          find ./bin/targets/mediatek/filogic/packages -type f -name "*.ipk" -exec cp -fv {} "$TMP_PKG_DIR/" \;
+
+          echo "建立套件索引..."
+          apt-get update
+          apt-get install -y coreutils tar sed
+          
+          cat <<'EOF' > /tmp/ipkg-make-index.sh
+          #!/bin/bash
+
+          pkg_dir=$1
+
+          if [ -z $pkg_dir ] || [ ! -d $pkg_dir ]; then
+              echo "Usage: ipkg-make-index <package_directory>" >&2
+              exit 1
+          fi
+
+          empty=1
+
+          for pkg in `find $pkg_dir -name '*.ipk' | sort`; do
+              empty=
+              name="${pkg##*/}"
+              name="${name%%_*}"
+              [[ "$name" = "kernel" ]] && continue
+              [[ "$name" = "libc" ]] && continue
+              echo "Generating index for package $pkg" >&2
+              file_size=$(stat -L -c%s $pkg)
+              sha256sum=$(sha256sum $pkg | awk '{print $1}')
+              # Take pains to make variable value sed-safe
+              sed_safe_pkg=`echo $pkg | sed -e 's/^\.\///g' -e 's/\\//\\\\\\//g'`
+              tar -xzOf $pkg ./control.tar.gz | tar xzOf - ./control | sed -e "s/^Description:/Filename: $sed_safe_pkg\\
+          Size: $file_size\\
+          SHA256sum: $sha256sum\\
+          Description:/"
+              echo ""
+          done
+          [ -n "$empty" ] && echo
+          exit 0
+          EOF
+          chmod +x /tmp/ipkg-make-index.sh
+
+          echo "建立套件索引..."
+          cwd_dir="$(pwd)""
+          cd "$TMP_PKG_DIR" || exit 1
+          gosu "${HOST_UGID}" /tmp/ipkg-make-index.sh . | tee Packages
+          gzip -9c Packages > Packages.gz
+
+          echo "打包套件檔案 (包含索引)..."
+          tar -czf "$PACKAGE_TGZ" -C . .
+          
+          echo "清理暫存目錄..."
+          cd "$cwd_dir" || exit 1
+          rm -rf "$TMP_PKG_DIR"
+
+          echo "產物整理完成。"
+
+      # --- 上傳步驟 ---
+      - name: Deliver buildinfo
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_buildinfo
+          path: ./artifact/buildinfo/
+
+      - name: Deliver package
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_package
+          path: ./artifact/packages.tgz
+
+      - name: Deliver firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_firmware
+          path: ./artifact/firmware/
+
+      - name: Deliver makeconfig
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_makeconfig
+          include-hidden-files: true
+          path: ./artifact/makeconfig/
+
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    container:
+      image: public.ecr.aws/docker/library/alpine:latest
+      env:
+        TZ: Asia/Taipei
+    steps:
+      - name: Download Firmware Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_firmware
+          path: artifact/firmware
+
+      - name: Download Package Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_package
+          path: artifact/packages
+
+      - name: Download Buildinfo Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_buildinfo
+          path: artifact/buildinfo
+
+      - name: Download MakeConfig Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_makeconfig
+          path: artifact/makeconfig
+      
+      - name: Install Dependencies
+        run: |
+          apk add --no-cache rsync openssh-client openssh-client-common git
+
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.RSYNC_SSH_KEY }}
+
+      - name: Rsync to Remote OPKG Server and extract packages
+        env:
+          RSYNC_PORT: ${{ secrets.RSYNC_PORT }}
+          RSYNC_USER: ${{ secrets.RSYNC_USER }}
+          RSYNC_HOST: ${{ secrets.RSYNC_HOST }}
+          RSYNC_DEST_PATH: ${{ secrets.RSYNC_DEST_PATH }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          if ! gzip -t artifact/packages/packages.tgz; then
+            echo "❌ Local packages.tgz is invalid or corrupted."
+            exit 1
+          fi
+
+          rsync -e "ssh -p $RSYNC_PORT -o StrictHostKeyChecking=no" -avz --delete artifact/ "$RSYNC_USER@$RSYNC_HOST:$RSYNC_DEST_PATH/$GITHUB_SHA"
+
+          ssh -p "$RSYNC_PORT" -o StrictHostKeyChecking=no "$RSYNC_USER@$RSYNC_HOST" "touch $RSYNC_DEST_PATH/$GITHUB_SHA/.done"
+      
+          ssh -p "$RSYNC_PORT" -o StrictHostKeyChecking=no "$RSYNC_USER@$RSYNC_HOST" << EOF
+            DONE="$RSYNC_DEST_PATH/$GITHUB_SHA/.done"
+            TGZ="$RSYNC_DEST_PATH/$GITHUB_SHA/packages/packages.tgz"
+            TARGET_DIR="$RSYNC_DEST_PATH/$GITHUB_SHA/packages"
+
+            for i in {1..30}; do
+              [ -f "\$DONE" ] && break
+              sleep 1
+            done
+
+            if [ ! -f "\$DONE" ]; then
+              echo "❌ Timeout waiting for .done file"
+              exit 1
+            fi
+
+            if [ -f "\$TGZ" ]; then
+              if gzip -t "\$TGZ"; then
+                mkdir -p "\$TARGET_DIR"
+                tar -xvzf "\$TGZ" -C "\$TARGET_DIR" && rm -f "\$TGZ"
+                echo "✅ Extracted packages.tgz successfully"
+              else
+                echo "❌ packages.tgz is corrupted or incomplete"
+                exit 1
+              fi
+            else
+              echo "⚠️ packages.tgz not found"
+              exit 1
+            fi
+          EOF
