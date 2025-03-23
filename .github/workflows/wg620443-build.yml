@@ -1,0 +1,216 @@
+name: Build OpenWRT for WG620443
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release 標籤名稱'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    
+    steps:
+    - name: 檢查空間
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf "/usr/local/share/boost"
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        df -h
+        
+    - name: 安裝編譯所需套件
+      run: |
+        sudo apt-get update
+        sudo apt-get -y install build-essential ccache ecj fastjar file g++ gawk \
+        gettext git java-propose-classpath libelf-dev libncurses5-dev \
+        libncursesw5-dev libssl-dev python python2.7-dev python3 unzip wget \
+        python3-distutils python3-setuptools rsync subversion swig time \
+        xsltproc zlib1g-dev
+
+    - name: Checkout 程式碼
+      uses: actions/checkout@v2
+      
+    - name: 設定 ccache
+      uses: actions/cache@v2
+      with:
+        path: ~/.ccache
+        key: ${{ runner.os }}-ccache-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    - name: 更新 feeds
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        
+    - name: 生成配置文件
+      run: |
+        cat > .config <<EOF
+        CONFIG_TARGET_mediatek=y
+        CONFIG_TARGET_mediatek_mt7986=y
+        CONFIG_TARGET_mediatek_mt7986_DEVICE_arcadyan_wg620443=y
+        
+        # 編譯所有可用的模組
+        CONFIG_ALL=y
+        CONFIG_PACKAGE_ALL=y
+        
+        # 基礎系統配置
+        CONFIG_PACKAGE_dnsmasq-full=y
+        CONFIG_PACKAGE_luci=y
+        CONFIG_PACKAGE_luci-ssl=y
+        
+        # 必要的韌體和驅動
+        CONFIG_PACKAGE_kmod-ubootenv-nvram=y
+        CONFIG_PACKAGE_kmod-mt7986-firmware=y
+        CONFIG_PACKAGE_mt7986-wo-firmware=y
+        CONFIG_PACKAGE_uencrypt-mbedtls=y
+        CONFIG_PACKAGE_kmod-mt7915e=y
+        
+        # Mesh 相關
+        CONFIG_PACKAGE_kmod-batman-adv=y
+        CONFIG_PACKAGE_batctl-default=y
+        CONFIG_PACKAGE_mesh11sd=y
+        CONFIG_PACKAGE_lime-system=y
+        CONFIG_PACKAGE_lime-proto-batadv=y
+        CONFIG_PACKAGE_openwisp-config=y
+        
+        # LuCI 應用和主題
+        CONFIG_PACKAGE_luci-i18n-base-zh-tw=y
+        CONFIG_PACKAGE_luci-theme-bootstrap=y
+        CONFIG_PACKAGE_luci-theme-material=y
+        CONFIG_PACKAGE_luci-theme-openwrt=y
+        
+        # 常用網路工具
+        CONFIG_PACKAGE_tcpdump=y
+        CONFIG_PACKAGE_iperf3=y
+        CONFIG_PACKAGE_ip-full=y
+        CONFIG_PACKAGE_mtr=y
+        CONFIG_PACKAGE_openssh-sftp-server=y
+        CONFIG_PACKAGE_wireguard-tools=y
+        
+        # 系統工具
+        CONFIG_PACKAGE_htop=y
+        CONFIG_PACKAGE_nano=y
+        CONFIG_PACKAGE_vim-full=y
+        CONFIG_PACKAGE_zsh=y
+        CONFIG_PACKAGE_bash=y
+        CONFIG_PACKAGE_curl=y
+        CONFIG_PACKAGE_wget=y
+        CONFIG_PACKAGE_rsync=y
+        
+        # 監控和統計
+        CONFIG_PACKAGE_collectd=y
+        CONFIG_PACKAGE_luci-app-statistics=y
+        CONFIG_PACKAGE_netdata=y
+        
+        # USB 支援
+        CONFIG_PACKAGE_kmod-usb-core=y
+        CONFIG_PACKAGE_kmod-usb3=y
+        CONFIG_PACKAGE_kmod-usb-storage=y
+        CONFIG_PACKAGE_block-mount=y
+        
+        # 檔案系統支援
+        CONFIG_PACKAGE_kmod-fs-ext4=y
+        CONFIG_PACKAGE_kmod-fs-ntfs=y
+        CONFIG_PACKAGE_kmod-fs-vfat=y
+        
+        # 其他網路協定支援
+        CONFIG_PACKAGE_kmod-tun=y
+        CONFIG_PACKAGE_kmod-nft-nat=y
+        CONFIG_PACKAGE_kmod-nft-nat6=y
+        
+        # 啟用 initramfs
+        CONFIG_TARGET_ROOTFS_INITRAMFS=y
+        
+        # 編譯選項優化
+        CONFIG_DEVEL=y
+        CONFIG_BUILD_LOG=y
+        CONFIG_CCACHE=y
+        CONFIG_KERNEL_BUILD_DOMAIN="github"
+        CONFIG_KERNEL_BUILD_USER="builder"
+        
+        # Image 設定
+        CONFIG_TARGET_ROOTFS_PARTSIZE=1024
+        EOF
+        
+        make defconfig
+
+    - name: 設定 ccache
+      run: |
+        mkdir -p ~/.ccache
+        echo "max_size = 10G" > ~/.ccache/ccache.conf
+        echo "compression = true" >> ~/.ccache/ccache.conf
+
+    - name: 下載依賴
+      run: |
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: 編譯韌體
+      run: |
+        make -j$(nproc) || make -j1 V=s
+        echo "::set-output name=status::success"
+        
+    - name: 檢查編譯結果
+      run: |
+        ls -la bin/targets/
+        echo "=============================================="
+        echo "空間使用狀況:"
+        df -h
+        echo "=============================================="
+        du -h --max-depth=1 ./ --exclude=build_dir --exclude=staging_dir
+        echo "=============================================="
+        du -h --max-depth=1 ./build_dir
+        echo "=============================================="
+        du -h --max-depth=1 ./staging_dir
+
+    - name: 整理檔案
+      run: |
+        cd bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        
+    - name: 生成檔案清單
+      run: |
+        cd $FIRMWARE
+        echo "::set-output name=files::$(ls -1 | tr '\n' ' ')"
+        echo "=== 檔案清單 ==="
+        ls -lh
+        echo "================"
+        
+    - name: 建立 Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ github.event.inputs.release_tag }}
+        files: ${{ env.FIRMWARE }}/*
+        generate_release_notes: true
+        body: |
+          ## OpenWRT 韌體 - WG620443
+          
+          ### 包含功能
+          - 基本系統和 LuCI 介面
+          - Mesh 網路支援 (Batman-adv, 802.11s)
+          - LibreMesh 和 OpenWISP 支援
+          - 完整的網路工具集
+          - 系統監控和管理工具
+          - USB 和檔案系統支援
+          
+          ### 檔案說明
+          - initramfs-factory.bin: 首次刷入用檔案
+          - sysupgrade.bin: 系統升級用檔案
+          
+          ### 編譯資訊
+          - 編譯時間: ${{ env.GITHUB_SHA }}
+          - 編譯分支: ${{ github.ref }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: 刪除舊的工作流程執行記錄
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        retain_days: 7
+        keep_minimum_runs: 3
