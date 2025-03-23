@@ -1,0 +1,279 @@
+name: Build and Release OpenWRT
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - wg620443
+      - v24.10.0-wg620443
+      - v24.10.1-wg620443
+
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 0
+    container:
+      image: public.ecr.aws/docker/library/python:3.11-slim-bookworm
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        TZ: Asia/Taipei
+
+    steps:
+      - name: 安裝 gosu
+        run: |
+          set -eux
+          GOSU_VERSION=1.17
+
+          # Save list of manually installed packages
+          savedAptMark="$(apt-mark showmanual)"
+
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates gnupg wget
+          rm -rf /var/lib/apt/lists/*
+
+          dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')"
+
+          wget -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${dpkgArch}"
+          wget -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${dpkgArch}.asc"
+
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4
+          gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu
+          gpgconf --kill all
+          rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc
+
+          apt-mark auto '.*' > /dev/null
+          [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark
+          apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false
+
+          chmod +x /usr/local/bin/gosu
+
+          # Verify installation
+          gosu --version
+          gosu nobody true
+
+      - name: 檢測資料夾權限
+        run: |
+          HOST_UID=$(stat -c "%u" /github/home)
+          HOST_GID=$(stat -c "%g" /github/home)
+
+          echo "HOST_UGID=${HOST_UID}:${HOST_GID}" >> $GITHUB_ENV
+
+      - name: 更新套件清單並安裝編譯依賴
+        run: |
+          apt-get update
+
+          apt-get install -y \
+            build-essential clang curl flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-distutils python3-setuptools rsync swig unzip zlib1g-dev file wget \
+            libexpat1-dev clang-format \
+            python3-yaml ruby-full libcap2-bin libsndio-dev libmariadb-dev libxml-parser-perl
+
+          python3 -c "import sys; assert sys.version_info[:2] == (3,11), f'Expected Python 3.11, got {sys.version}'"
+
+      - name: Checkout OpenWRT 程式碼
+        uses: actions/checkout@v4
+
+      - name: 變更 OpenWRT 目錄擁有者
+        run: chown -R "${HOST_UGID}" .
+
+      - name: 更新 feeds
+        run: |
+          gosu "${HOST_UGID}" ./scripts/feeds update -a
+          gosu "${HOST_UGID}" ./scripts/feeds install -a
+          
+      - name: 複製自訂 .config
+        run: |
+          gosu "${HOST_UGID}" cp .config.wg620443 .config
+
+      - name: 清除 __pycache__
+        run: |
+          set -e
+          find staging_dir/hostpkg/lib -type d -name "python3.*" | while read pydir; do
+            find "$pydir" \( -name '__pycache__' -o -name '*.pyc' \) -exec rm -rf {} +
+          done
+
+      - name: 編譯韌體
+        shell: bash
+        run: |
+          for dir in /.cache /.cargo /.local; do
+            mkdir -p "$dir"
+            chmod -R 777 "$dir"
+          done
+          
+          LOG_DIR=artifact/logs
+          echo "LOG_DIR=${LOG_DIR}" >> $GITHUB_ENV
+          mkdir -p "${LOG_DIR}"
+
+          LOGFILE="${LOG_DIR}/build_firmware.log"
+          echo "LOGFILE=${LOGFILE}" >> $GITHUB_ENV
+
+          set +e
+
+          # fix mesa cannot find dependencies
+          gosu "${HOST_UGID}" staging_dir/host/bin/python3 -m pip install -r feeds/video/libs/mesa/host-pip-requirements.txt
+
+          # fix abimap not found
+          pip install abimap --break-system-packages
+
+          gosu "${HOST_UGID}" make -k -j"$(nproc)" V=s USE_CCACHE=1 CCACHE_DIR="${{ env.CCACHE_DIR }}" | tee "$LOGFILE"
+          MAKE_RESULT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$MAKE_RESULT" -ne 0 ]; then
+            echo "⚠️ Firmware build failed. See ${LOGFILE}"
+            exit "$MAKE_RESULT"
+          fi
+
+      - name: 收集編譯錯誤日誌
+        run: |
+          LOGFILE="${LOG_DIR}/build_firmware.log"
+          ERRORLOG="${LOG_DIR}/failed_firmware_modules.txt"
+
+          echo "🔍 正在掃描 firmware 編譯 log 中的錯誤模組..." > "$ERRORLOG"
+
+          # 從 log 中找出常見錯誤關鍵字，並提取周圍訊息
+          grep -E -B 5 -A 5 "recipe for target|error:|undefined reference|collect2: error|make\[[0-9]\]: \*\*\*|failed to build" "$LOGFILE" >> "$ERRORLOG" || true
+
+          echo "" >> "$ERRORLOG"
+          echo "📦 如果上面有列出模組，請參考修正。" >> "$ERRORLOG"
+
+          echo "✅ 錯誤分析完成，輸出於: $ERRORLOG"
+
+      - name: 整理編譯產物
+        run: |
+          ARTIFACT_DIR="./artifact"
+          FIRMWARE_DIR="$ARTIFACT_DIR/firmware"
+          BUILDINFO_DIR="$ARTIFACT_DIR/buildinfo"
+          MAKECONFIG_DIR="$ARTIFACT_DIR/makeconfig"
+          TMP_PKG_DIR="/tmp/packages"
+          PACKAGE_TGZ="$ARTIFACT_DIR/packages.tgz"
+
+          set -e
+
+          echo "建立產物目錄..."
+          mkdir -p "$FIRMWARE_DIR" "$BUILDINFO_DIR" "$MAKECONFIG_DIR" "$TMP_PKG_DIR"
+          chmod 777 "$FIRMWARE_DIR" "$BUILDINFO_DIR" "$MAKECONFIG_DIR" "$TMP_PKG_DIR"
+
+          echo "複製 Firmware 檔案..."
+          find ./bin/targets -maxdepth 3 -type f \( -name "*.bin" -o -name "*.img" -o -name "*.trx" -o -name "*.img.gz" -o -name "*.ubi" -o -name "*.ubifs" \) -exec cp -fv {} "$FIRMWARE_DIR/" \;
+
+          echo "複製 Buildinfo 和 Manifest 檔案..."
+          find ./bin/targets -maxdepth 3 -type f \( -name "*.buildinfo" -o -name "*.manifest" \) -exec cp -fv {} "$BUILDINFO_DIR/" \;
+
+          echo "複製 IPK 套件檔案..."
+          find ./bin/packages/ -type f -name "*.ipk" -exec cp -fv {} "$TMP_PKG_DIR/" \;
+
+          echo "複製 .config 檔案..."
+          cp -fv .config "$MAKECONFIG_DIR/"
+
+          echo "產生套件索引檔..."
+          gosu "${HOST_UGID}" ./scripts/ipkg-make-index.sh "$TMP_PKG_DIR" | tee "$TMP_PKG_DIR/Packages"
+          gzip -9c "$TMP_PKG_DIR/Packages" > "$TMP_PKG_DIR/Packages.gz"
+          rm "$TMP_PKG_DIR/Packages"
+
+          echo "打包套件檔案 (包含索引)..."
+          tar -czf "$PACKAGE_TGZ" -C "$TMP_PKG_DIR" .
+
+          echo "清理暫存目錄..."
+          rm -rf "$TMP_PKG_DIR"
+
+          echo "產物整理完成。"
+
+      - name: 生成檔案清單 (FILES.md)
+        run: |
+          set -e
+          cd artifact
+          echo "產生 FILES.md..."
+          {
+            printf "# OpenWRT 固件與套件清單 (分批編譯)\n\n"
+            printf "## 固件檔案\n"
+            ls -l firmware/ | awk 'NR>1 {print "- " $9 " (" $5 ")"}'
+            printf "\n## 套件檔案\n"
+            printf -- "- packages.tgz ($(du -s packages.tgz | awk '{print $1 " blocks"}'))\n\n"
+            printf "## Build Info & Manifest\n"
+            ls -l buildinfo/ | awk 'NR>1 {print "- " $9 " (" $5 ")"}'
+            printf "\n## Make Config\n"
+            ls -l makeconfig/ | awk 'NR>1 {print "- " $9 " (" $5 ")"}'
+            printf "\n## 可用套件列表 (從 packages.tgz 提取)\n"
+            tar xzf packages.tgz -O Packages.gz 2>/dev/null | gunzip 2>/dev/null | grep "^Package:" | cut -d " " -f 2 | sort
+          } > FILES.md
+          echo "FILES.md 已產生。"
+          cat FILES.md
+
+      # --- 上傳步驟 ---
+      - name: Deliver buildinfo
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_buildinfo
+          path: ./artifact/buildinfo/
+
+      - name: Deliver package
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_package
+          path: ./artifact/packages.tgz
+
+      - name: Deliver firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_firmware
+          path: ./artifact/firmware/
+
+      - name: Deliver makeconfig
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_makeconfig
+          path: ./artifact/makeconfig/
+
+      - name: Deliver FILES.md
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_filelist
+          path: ./artifact/FILES.md
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Firmware Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_firmware
+          path: artifact/firmware
+
+      - name: Download Package Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_package
+          path: artifact/packages
+
+      - name: Download Buildinfo Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_buildinfo
+          path: artifact/buildinfo
+
+      - name: Download Makeconfig Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_makeconfig
+          path: artifact/makeconfig
+
+      - name: Download File List
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_filelist
+          path: artifact
+
+      - name: Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.5.4
+        with:
+          ssh-private-key: ${{ secrets.RSYNC_SSH_KEY }}
+
+      - name: Rsync to Remote OPKG Server
+        run: |
+          rsync -e 'ssh -p ${{ secrets.RSYNC_PORT }}' -avz --delete \
+            artifact/ \
+            ${{ secrets.RSYNC_USER }}@${{ secrets.RSYNC_HOST }}:${{ secrets.RSYNC_DEST_PATH }}/${{ github.sha }}
