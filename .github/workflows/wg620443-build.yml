@@ -1,0 +1,272 @@
+name: Build and Release OpenWRT (Full Build)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - wg620443
+
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 0
+    container:
+      image: public.ecr.aws/lts/ubuntu:22.04
+      env:
+        DEBIAN_FRONTEND: noninteractive
+        TZ: Asia/Taipei
+        BUILD_USER: openwrt
+
+    steps:
+      - name: 安裝 sudo 並建立編譯使用者
+        run: |
+          apt update && apt install -y sudo
+          useradd -m "${BUILD_USER}" -G sudo
+
+      - name: 更新套件清單並安裝編譯依賴
+        run: |
+          apt install -y \
+            asciidoc \
+            antlr3 \
+            autoconf \
+            automake \
+            autopoint \
+            binutils \
+            bison \
+            build-essential \
+            bzip2 \
+            clang \
+            cmake \
+            curl \
+            device-tree-compiler \
+            file \
+            flex \
+            g++-multilib \
+            gawk \
+            gcc-multilib \
+            gettext \
+            git \
+            gperf \
+            lib32gcc-s1 \
+            libc6-dev-i386 \
+            libelf-dev \
+            libglib2.0-dev \
+            libncurses-dev \
+            libncurses5-dev \
+            libpthread-stubs0-dev \
+            libssl-dev \
+            libtool \
+            libz-dev \
+            msmtp \
+            nasm \
+            patch \
+            pkg-config \
+            p7zip \
+            p7zip-full \
+            python3 \
+            python3-setuptools \
+            python3-distutils \
+            python3-pip \
+            qemu-utils \
+            rsync \
+            subversion \
+            swig \
+            texinfo \
+            uglifyjs \
+            unzip \
+            upx \
+            wget \
+            xmlto \
+            yasm \
+            zlib1g-dev
+
+      - name: Checkout OpenWRT 程式碼
+        uses: actions/checkout@v4
+
+      - name: 變更 OpenWRT 目錄擁有者
+        run: chown -R "${BUILD_USER}":"${BUILD_USER}" .
+
+      - name: 更新 feeds
+        run: |
+          sudo -u "${BUILD_USER}" ./scripts/feeds update -a
+          sudo -u "${BUILD_USER}" ./scripts/feeds install -a
+
+      - name: 複製自訂 .config 並生成 defconfig
+        run: |
+          sudo -u "${BUILD_USER}" cp .config.wg620443 .config
+          sudo -u "${BUILD_USER}" make defconfig
+      
+      - name: 下載依賴
+        run: |
+          sudo -u "${BUILD_USER}" make download -j$(nproc)
+          sudo -u "${BUILD_USER}" find dl -size -1024c -exec rm -f {} \;
+
+      - name: 完整編譯固件與套件
+        run: |
+          sudo -u "${BUILD_USER}" make -j$(($(nproc)+1)) || sudo -u "${BUILD_USER}" make -j1 V=s
+
+          echo "======================="
+          echo "Space usage:"
+          echo "======================="
+          df -h
+          echo "======================="
+          du -h --max-depth=1 ./ --exclude=build_dir --exclude=bin
+          du -h --max-depth=1 ./build_dir
+          du -h --max-depth=1 ./bin
+
+      - name: 整理編譯產物
+        run: |
+          sudo -u "${BUILD_USER}" /bin/bash -c '
+            mkdir -p ./artifact/firmware
+            mkdir /tmp/packages
+            mkdir -p ./artifact/buildinfo
+            mkdir -p ./artifact/makeconfig
+
+            rm -rf $(find ./bin/targets/ -type d -name "packages")
+            cp -rf $(find ./bin/targets/ -type f) ./artifact/firmware/
+            cp -rf $(find ./bin/packages/ -type f -name "*.ipk") /tmp/packages/
+            cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
+            cp -rf $(find ./ -type f -name ".config" -maxdepth 1) ./artifact/makeconfig/
+
+            ../../scripts/ipkg-make-index.sh /tmp/packages > Packages
+            gzip -9c Packages > Packages.gz
+            rm Packages
+            cd ../..
+            tar czf ./artifact/packages.tgz -C /tmp/packages .
+            rm -rf /tmp/packages
+          '
+
+      - name: 生成檔案清單
+        run: |
+          sudo -u "${BUILD_USER}" /bin/bash -c '
+            cd artifact
+            {
+              echo "# OpenWRT 固件與套件清單 (完整編譯)"
+              echo ""
+              echo "## 固件檔案"
+              ls -lh firmware/*.bin | awk "{print \"- \"\$9\" (\"\$5\")\"}"
+              echo ""
+              echo "## 套件檔案"
+              echo "- packages.tgz ($(du -h packages.tgz | cut -f1))"
+              echo ""
+              echo "## 可用套件列表"
+              tar xzf packages.tgz -O Packages.gz | gunzip | grep "^Package:" | cut -d " " -f 2 | sort
+            } > FILES.md
+          '
+      - name: Deliver buildinfo
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_buildinfo
+          path: ./artifact/buildinfo/
+
+      - name: Deliver package
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_package
+          path: ./artifact/packages.tgz
+
+      - name: Deliver firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_firmware
+          path: ./bin/targets/
+
+      - name: Deliver makeconfig
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWrt_makeconfig
+          path: ./artifact/makeconfig
+
+
+  release:
+    name: Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設定版本標籤
+        id: tag
+        run: |
+          TAG="nightly.$(date -Iseconds | sed 's/[T:\+]/-/g')"
+          IS_PRERELEASE="true"
+          TIME=$(date '+%Y/%m/%d %H:%M')
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "time=$TIME" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          
+          git config --global user.name "${GITHUB_ACTOR}"
+          git config --global user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git tag -a $TAG -m "Published version $TAG" ${GITHUB_SHA}
+          git push origin $TAG
+
+      - name: 下載 buildinfo Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_buildinfo
+          path: release/buildinfo
+
+      - name: 下載 package Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_package
+          path: release
+
+      - name: 下載 firmware Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_firmware
+          path: release/firmware
+
+      - name: 下載 makeconfig Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: OpenWrt_makeconfig
+          path: release/makeconfig
+
+      - name: 建立 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/buildinfo/*
+            release/packages.tgz
+            release/firmware/**/*
+            release/makeconfig/*
+          prerelease: ${{ steps.tag.outputs.is_prerelease }}
+          make_latest: ${{ !steps.tag.outputs.is_prerelease }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.time }}
+          body: |
+            ## OpenWRT 固件 - WG620443 (完整編譯)
+            
+            ### 檔案說明
+            - 固件檔案：例如 initramfs-factory.bin 與 sysupgrade.bin
+            - packages.tgz：額外可安裝的 ipk 套件壓縮包
+            - FILES.md：檔案清單與套件列表
+            
+            ### opkg 安裝額外套件方式
+            1. 將 packages.tgz 解壓縮到 Web 伺服器或本機：
+            ```bash
+            tar xzf packages.tgz
+            ```
+            
+            2. 在路由器中設定套件來源
+            ```bash
+            # 編輯 /etc/opkg/customfeeds.conf
+            src/gz custom_packages https://openwrt.leko.moe/packages_sorted
+            ```
+            
+            3. 更新套件列表：
+            ```bash
+            opkg update
+            ```
+            
+            4. 安裝需要的套件：
+            ```bash
+            opkg install <套件名稱>
+            ```
+            
+            ### 編譯資訊
+            - 編譯時間：${{ steps.tag.outputs.time }}
+            - 提交：${{ github.sha }}
+            - 分支：${{ github.ref }}
